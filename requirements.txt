@@ -1,7 +1,8 @@
-duckduckgo-search>=6.1.7
-trafilatura>=1.8.0
-requests>=2.32.3
-pydantic>=2.7.0
-tenacity>=8.4.2
-python-dotenv>=1.0.1
-openai>=1.35.3
+duckduckgo-search
+trafilatura
+requests
+pydantic
+tenacity
+python-dotenv
+openai
+requests
