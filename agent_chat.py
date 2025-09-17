@@ -1,4 +1,4 @@
-# agent_chat.py
+import re
 import requests
 import json
 import time
@@ -6,63 +6,114 @@ import time
 OLLAMA_URL = "http://localhost:11434/api/generate"
 MODEL = "qwen:4b"
 
-def ask_qwen(prompt, model=MODEL, stream=False, timeout=30):
-    """
-    Llama a Ollama. Si stream=True imprime tokens según llegan.
-    Devuelve la respuesta completa como string (o un mensaje de error).
-    """
-    payload = {"model": model, "prompt": prompt, "stream": stream}
+# --- Herramienta clima ---
+def get_weather(city):
+    geo_url = f"https://geocoding-api.open-meteo.com/v1/search?name={city}&count=1&language=es&format=json"
+    geo_data = requests.get(geo_url).json()
+
+    if "results" not in geo_data:
+        return f"No encontré la ciudad {city}."
+
+    lat = geo_data["results"][0]["latitude"]
+    lon = geo_data["results"][0]["longitude"]
+
+    weather_url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current_weather=true&timezone=auto"
+    weather_data = requests.get(weather_url).json()
+
+    if "current_weather" not in weather_data:
+        return "No pude obtener el clima en este momento."
+
+    current = weather_data["current_weather"]
+    temp = current["temperature"]
+    wind = current["windspeed"]
+
+    return f"El clima en {city} es {temp}°C con viento de {wind} km/h."
+
+
+# --- Herramienta búsqueda web (simple) ---
+def web_search(query):
+    url = "https://duckduckgo.com/?q=" + query.replace(" ", "+")
+    return f"Puedes ver resultados en: {url}"
+
+
+# --- Llamada a Qwen ---
+def ask_qwen(prompt, model=MODEL, timeout=30):
+    payload = {"model": model, "prompt": prompt, "stream": False}
     try:
-        if stream:
-            with requests.post(OLLAMA_URL, json=payload, stream=True, timeout=timeout) as resp:
-                resp.raise_for_status()
-                collected = ""
-                for line in resp.iter_lines():
-                    if not line:
-                        continue
-                    try:
-                        chunk = json.loads(line.decode("utf-8"))
-                        token = chunk.get("response", "")
-                        collected += token
-                        print(token, end="", flush=True)
-                    except Exception:
-                        pass
-                print()
-                return collected
-        else:
-            resp = requests.post(OLLAMA_URL, json=payload, timeout=timeout)
-            resp.raise_for_status()
-            data = resp.json()
-            return data.get("response", "")
+        resp = requests.post(OLLAMA_URL, json=payload, timeout=timeout)
+        resp.raise_for_status()
+        return resp.json().get("response", "")
     except requests.exceptions.RequestException as e:
         return f"[Error conectando con Ollama: {e}]"
 
 
-def build_prompt(history, system_prompt=None):
-    """
-    Convierte history = list of (role, text) a un prompt legible.
-    role: "user" o "agent"
-    Añade 'Agente:' al final para que el modelo genere la respuesta.
-    """
-    parts = []
-    if system_prompt:
-        parts.append(system_prompt.strip())
-        parts.append("")
-    for role, text in history:
-        if role == "user":
-            parts.append(f"Usuario: {text}")
-        else:
-            parts.append(f"Agente: {text}")
-    parts.append("Agente:")
-    return "\n".join(parts)
+# --- Prompt con instrucciones JSON ---
+TOOL_PROMPT = """
+Eres un asistente que SOLO puede responder en JSON válido.
 
+Herramientas disponibles:
+1. get_weather(city) → da el clima actual de una ciudad.
+2. web_search(query) → busca información en internet.
+3. answer(text) → responde directamente al usuario.
 
+Reglas:
+- NO expliques nada fuera del JSON.
+- NO uses texto adicional.
+- Tu salida debe ser SOLO un JSON válido.
+
+Ejemplos válidos:
+{{"action": "get_weather", "args": {{"city": "Madrid"}}}}
+{{"action": "web_search", "args": {{"query": "últimas noticias de IA"}}}}
+{{"action": "answer", "args": {{"text": "Hola, ¿cómo estás?"}}}}
+
+Usuario: {user_input}
+Agente:
+"""
+
+def safe_json_parse(output: str):
+    """
+    Intenta extraer y parsear JSON de la salida del modelo.
+    Si falla, lo trata como una respuesta normal (action=answer).
+    """
+    output = output.strip()
+
+    # Caso 1: la salida completa es JSON válido
+    try:
+        return json.loads(output)
+    except json.JSONDecodeError:
+        pass
+
+    # Caso 2: buscar el primer bloque {...}
+    import re
+    match = re.search(r"\{.*\}", output, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(0))
+        except json.JSONDecodeError:
+            pass
+
+    # Caso 3: fallback → tratamos todo como respuesta normal
+    return {"action": "answer", "args": {"text": output}}
+
+# --- Ejecutar acción según JSON ---
+def execute_action(model_output):
+    action_obj = safe_json_parse(model_output)
+
+    action = action_obj.get("action")
+    args = action_obj.get("args", {})
+
+    if action == "get_weather":
+        return get_weather(args.get("city", ""))
+    elif action == "web_search":
+        return web_search(args.get("query", ""))
+    elif action == "answer":
+        return args.get("text", "")
+    else:
+        return f"[Error: acción desconocida {action}]"
+
+# --- Bucle principal ---
 def main():
-    system_prompt = (
-        "Eres un asistente conversacional en español. Responde de forma clara, breve y útil."
-    )
-    history = []  # [(role, text), ...]
-    print("Chat con Qwen (qwen:4b). Escribe 'salir' para terminar.")
+    print("Agente con herramientas (Qwen + JSON). Escribe 'salir' para terminar.")
     while True:
         try:
             user_input = input("Tú: ").strip()
@@ -76,26 +127,18 @@ def main():
             print("Adiós 👋")
             break
 
-        # añadir entrada del usuario al historial
-        history.append(("user", user_input))
+        # Construir prompt con la instrucción de JSON
+        prompt = TOOL_PROMPT.format(user_input=user_input)
 
-        # limitar historial a N turnos para no exceder contexto
-        max_turn_pairs = 6  # número de pares usuario/agente a conservar
-        # cada turno es usuario+agente ≈ 2 entradas; tomamos last 2*max_turn_pairs
-        short_history = history[-(max_turn_pairs * 2):]
+        # Pedir al modelo
+        model_output = ask_qwen(prompt)
 
-        # construir prompt
-        prompt = build_prompt(short_history, system_prompt)
+        # Ejecutar acción
+        respuesta = execute_action(model_output)
 
-        # pedir respuesta al modelo (stream=False por defecto)
-        respuesta = ask_qwen(prompt, stream=False)
-
-        # guardar respuesta en el historial y mostrar al usuario
-        history.append(("agent", respuesta))
         print("Agente:", respuesta)
-        # pequeño retardo opcional para evitar spam al servidor
-        time.sleep(0.05)
 
 
 if __name__ == "__main__":
     main()
+
